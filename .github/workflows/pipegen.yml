@@ -1,0 +1,66 @@
+# S4 spike: baseline artifact on main, read back from pull_request runs (same repo and fork).
+name: pipegen
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions: {}
+jobs:
+  baseline:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions: {contents: read}
+    steps:
+      - run: printf '{"runId": %s, "counts": {"FAKE-fp-1": 1}}\n' "$GITHUB_RUN_ID" > baseline.json && cat baseline.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: {name: pipegen-baseline, path: baseline.json, retention-days: 1}
+
+  # Reads the baseline with actions: read + pull-requests: read (what Plan C asks for).
+  pr-read:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions: {actions: read, pull-requests: read}
+    outputs: {run: "${{ steps.r.outputs.run }}"}
+    env: {GH_TOKEN: "${{ github.token }}", R: "${{ github.repository }}", PR: "${{ github.event.pull_request.number }}"}
+    steps:
+      - id: r
+        run: |
+          set +e
+          echo "== self run"; gh api "repos/$R/actions/runs/$GITHUB_RUN_ID" --jq '{event,head_branch,path,repository_id:.repository.id,head_repository_id:.head_repository.id,head_repo:.head_repository.full_name}'; echo "exit=$?"
+          echo "== list artifacts named pipegen-baseline"
+          gh api "repos/$R/actions/artifacts?name=pipegen-baseline" --jq '.total_count, (.artifacts[]|{id,expired,expires_at,workflow_run})'; echo "exit=$?"
+          id=$(gh api "repos/$R/actions/artifacts?name=pipegen-baseline" --jq '[.artifacts[]|select(.workflow_run.head_branch=="main" and .workflow_run.head_repository_id==.workflow_run.repository_id and .expired==false)][0]|"\(.id) \(.workflow_run.id)"')
+          echo "picked artifact/run: $id"; set -- $id
+          echo "run=$2" >> "$GITHUB_OUTPUT"
+          echo "== producing run"; gh api "repos/$R/actions/runs/$2" --jq '{event,head_branch,path,head_repository_id:.head_repository.id}'
+          echo "== download zip via REST"; gh api "repos/$R/actions/artifacts/$1/zip" > b.zip; echo "exit=$?"; unzip -p b.zip; echo
+          echo "== PR files"; gh api "repos/$R/pulls/$PR/files" --jq '.[]|.filename+" "+.status'; echo "exit=$?"
+      - name: download via actions/download-artifact (cross-run)
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: {name: pipegen-baseline, run-id: "${{ steps.r.outputs.run }}", github-token: "${{ github.token }}", path: dl}
+      - run: ls -la dl && cat dl/* || echo "download-artifact gave nothing"
+
+  # Same calls with contents: read only (no actions / pull-requests permission).
+  pr-noperm:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions: {contents: read}
+    env: {GH_TOKEN: "${{ github.token }}", R: "${{ github.repository }}", PR: "${{ github.event.pull_request.number }}"}
+    steps:
+      - run: |
+          set +e
+          echo "== list artifacts"; gh api "repos/$R/actions/artifacts?name=pipegen-baseline" --jq '.total_count'; echo "exit=$?"
+          id=$(gh api "repos/$R/actions/artifacts?name=pipegen-baseline" --jq '[.artifacts[]|select(.workflow_run.head_branch=="main")][0].id')
+          echo "== download zip"; gh api "repos/$R/actions/artifacts/$id/zip" > b.zip; echo "exit=$?"; unzip -p b.zip; echo
+          echo "== PR files"; gh api "repos/$R/pulls/$PR/files" --jq '.[]|.filename'; echo "exit=$?"
+
+  # A PR run (attacker-controlled on a fork) can upload an artifact with the same name.
+  pr-fake-upload:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: printf '{"runId": %s, "counts": {}}\n' "$GITHUB_RUN_ID" > baseline.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with: {name: pipegen-baseline, path: baseline.json, retention-days: 1}
